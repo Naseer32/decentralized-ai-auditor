@@ -1,6 +1,6 @@
 # Jagorar Gwajin Decentralized AI Auditor a GenLayer Studio
 
-Contract address: `0x65aA3ce55c9Bc1895586021A20F0Be4dAa674096`
+Contract address: `0xd3E17a9E243C6A275d652a6c1142eADbf944B0bB`
 Fayil: `contracts/decentralized_ai_auditor.py` (19,865 bytes)
 
 > Ban iya shiga chain ɗinka ba, don haka ba zan iya ganin yanayin contract ɗin ba. Dole ka gudanar da gwaje-gwajen, ka aiko mini sakamako (ko kuskuren da ya fito) don in tantance.
