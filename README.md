@@ -2,9 +2,8 @@
 
 A [GenLayer](https://www.genlayer.com) Intelligent Contract that audits AI-generated claims against web sources, records each verdict with evidence and a confidence level, and keeps a tamper-evident audit history.
 
-- **Contract:** `contracts/decentralized_ai_auditor.py` (about 19.9 KB; header `py-genlayer:test`, for GenLayer Studio)
-- **Studio address (tested):** `0xd3E17a9E243C6A275d652a6c1142eADbf944B0bB`
-- **Bradbury address:** `0x65aA3ce55c9Bc1895586021A20F0Be4dAa674096` (deployed earlier; transactions were not processing, so testing was done on Studio)
+- **Contract:** `contracts/decentralized_ai_auditor.py` (about 20.5 KB; header `py-genlayer:test`, for GenLayer Studio)
+- **Studio address (tested):** `0x69503BCFc3b3f0ceBdCDbD6861877f16cF54E634`
 
 ## How consensus works
 
