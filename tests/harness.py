@@ -1,5 +1,6 @@
 """Deterministic harness: a fake `genlayer` module so the contract runs under plain unittest/pytest."""
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -27,7 +28,7 @@ class TreeMap(dict):
 
 class World:
     def __init__(self):
-        self.pages, self.llm, self.llm_calls, self.principles = {}, None, [], []
+        self.pages, self.llm, self.llm_calls, self.runs, self.mutate = {}, None, [], 0, None
 
 
 WORLD = World()
@@ -38,24 +39,46 @@ def reset_world():
     WORLD.__init__()
 
 
-def _render(url, mode="text"):
+class Lazy:
+    def __init__(self, v):
+        self.v = v
+
+    def get(self):
+        return self.v
+
+
+class Return:
+    def __init__(self, calldata):
+        self.calldata = calldata
+
+
+def _web_get(url):
     v = WORLD.pages.get(url)
     if v is None or isinstance(v, Exception):
         raise RuntimeError("fetch failed")
-    return v
+    status, text = v if isinstance(v, tuple) else (200, v)
+    return Lazy(types.SimpleNamespace(status=status, body=text.encode("utf-8")))
 
 
-def _exec_prompt(prompt, response_format="text"):
+def _exec_prompt(prompt):
     WORLD.llm_calls.append(prompt)
     out = WORLD.llm(prompt) if callable(WORLD.llm) else WORLD.llm
     if isinstance(out, Exception):
         raise out
-    return out
+    if isinstance(out, dict):  # real models answer with text containing JSON
+        out = "Here is my answer: " + json.dumps(out)
+    return Lazy(out)
 
 
-def _prompt_comparative(fn, principle):
-    WORLD.principles.append(principle)
-    return fn()
+def _run_nondet(leader, validator):
+    """Leader runs, then one validator re-runs and must accept the leader's result."""
+    WORLD.runs += 1
+    res = Return(leader())
+    if WORLD.mutate:
+        res.calldata = WORLD.mutate(res.calldata)
+    if not validator(res):
+        raise RuntimeError("validators rejected the leader result")
+    return res.calldata
 
 
 class _Msg:
@@ -64,21 +87,22 @@ class _Msg:
         return STATE.sender
 
 
-gl = types.SimpleNamespace(
-    Contract=object,
-    public=types.SimpleNamespace(view=lambda f: f, write=lambda f: f),
-    message=_Msg(),
-    vm=types.SimpleNamespace(UserError=UserError),
-    nondet=types.SimpleNamespace(
-        web=types.SimpleNamespace(render=_render), exec_prompt=_exec_prompt
-    ),
-    eq_principle=types.SimpleNamespace(prompt_comparative=_prompt_comparative),
-)
-
 _mod = types.ModuleType("genlayer")
-_mod.gl, _mod.Address, _mod.TreeMap, _mod.u256 = gl, Address, TreeMap, int
-_mod.__all__ = ["gl", "Address", "TreeMap", "u256"]
-sys.modules["genlayer"] = _mod
+_mod.Address, _mod.u256 = Address, int
+_mod.contract = types.SimpleNamespace(Contract=object)
+_mod.public = types.SimpleNamespace(view=lambda f: f, write=lambda f: f)
+_mod.message = _Msg()
+_mod.vm = types.SimpleNamespace(UserError=UserError, Return=Return, run_nondet=_run_nondet)
+_mod.nondet = types.SimpleNamespace(
+    Lazy=Lazy, web=types.SimpleNamespace(get=_web_get), exec_prompt=_exec_prompt
+)
+_mod.__all__ = ["Address", "u256"]
+_types = types.ModuleType("genlayer.types")
+_types.Address, _types.u256, _types.__all__ = Address, int, ["Address", "u256"]
+_storage = types.ModuleType("genlayer.storage")
+_storage.TreeMap, _storage.DynArray = TreeMap, list
+sys.modules.update({"genlayer": _mod, "genlayer.types": _types, "genlayer.storage": _storage})
+gl = _mod
 
 _PATH = pathlib.Path(__file__).parent.parent / "contracts" / "decentralized_ai_auditor.py"
 _spec = importlib.util.spec_from_file_location("auditor_contract", _PATH)

@@ -1,11 +1,14 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# { "Depends": "py-genlayer:test" }
+import genlayer as gl
 from genlayer import *
+from genlayer.types import *
+from genlayer.storage import TreeMap, DynArray
 import hashlib, json, re
 
 DEFS = {
   "SUPPORTED": "sources establish the whole claim",
-  "PARTIALLY_SUPPORTED": "some parts established, others missing or overstated",
-  "UNSUPPORTED": "sources relevant but do not establish the claim",
+  "PARTIALLY_SUPPORTED": "some parts established, others missing",
+  "UNSUPPORTED": "sources relevant but do not establish it",
   "CONTRADICTED": "sources conflict with the claim",
   "INCONCLUSIVE": "sources unavailable, irrelevant or insufficient",
 }
@@ -17,14 +20,14 @@ USABLE = ("OK", "INJECTION_REDACTED")
 STANCES = ("supports", "contradicts", "neutral")
 GENESIS = "0" * 64
 MIN_CLAIM, MAX_CLAIM, MAX_CTX, MIN_REASON, MAX_REASON = 10, 1000, 500, 20, 800
-MAX_SOURCES, MAX_URL, MAX_PAGE, MIN_PAGE = 5, 300, 6000, 20
+MAX_SOURCES, MAX_URL, MAX_PAGE, MIN_PAGE = 5, 300, 12000, 20
 MAX_EVIDENCE, MIN_QUOTE, MAX_QUOTE, MAX_RATIONALE, MAX_FLAGS = 5, 15, 300, 600, 10
-MAX_REVISIONS, MAX_DISPUTES, MAX_RECORDS_PER_ADDRESS, MAX_VERIFY, MAX_LIST = 5, 3, 500, 200, 50
+MAX_REVISIONS, MAX_DISPUTES, MAX_RECORDS_PER_ADDRESS, MAX_VERIFY = 5, 3, 500, 200
 OVERTURN_MIN, SINGLE_CAP, UNTRUSTED_CAP, NOQUOTE_CAP, INCONC_CAP = 60, 80, 70, 60, 30
-PRINCIPLE = (
-  "Results are equivalent iff 'verdict' is identical and 'confidence' differs by "
-  "at most 15. Ignore rationale, evidence, quotes, flags and other fields."
-)
+# Confidence = band floor (low <60, medium 60-79, high 80+); 60 is the dispute-overturn threshold.
+BANDS = (0, 60, 80)
+
+
 def _fail(code, msg):
   raise gl.vm.UserError("[" + code + "] " + msg)
 _CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
@@ -140,9 +143,9 @@ def apply_policy(raw, urls, trusted, cap):
     conf = min(conf, UNTRUSTED_CAP)
     flag("NO_TRUSTED_EVIDENCE")
   if v == V_I and not why:
-    why = "Sources insufficient to judge the claim."
-  return {"verdict": v, "confidence": conf, "rationale": why, "evidence": ev,
-      "source_status": ss, "flags": flags}
+    why = "Sources insufficient."
+  return {"verdict": v, "confidence": max(b for b in BANDS if b <= conf), "rationale": why,
+      "evidence": ev, "source_status": ss, "flags": flags}
 def _prompt(claim, label, ctx, urls, texts):
   blocks = "\n".join(
     "<<<SOURCE index=%d url=%s>>>\n%s\n<<<END SOURCE>>>" % (i, u, t or "(unavailable)")
@@ -158,25 +161,56 @@ def _prompt(claim, label, ctx, urls, texts):
     '"rationale": "<max 500 chars>", "evidence": [{"source_index": <int>, "quote": '
     '"<verbatim from that source, 15-300 chars>", "stance": "supports|contradicts|neutral"}]}'
     "\nQuotes must be verbatim; max 5 items.")
-def _model_json(out):
-  if isinstance(out, str):
-    t = out.strip().strip("`")
-    t = t[4:] if t[:4].lower() == "json" else t
+def _body(h):
+  h = re.sub(r"(?is)<(script|style|noscript|nav|header|footer|aside)[^>]*>.*?</\1>", " ", h)
+  ps = re.findall(r"(?is)<p[^>]*>(.*?)</p>", h)
+  t = " ".join(ps) if sum(map(len, ps)) > 300 else h
+  return re.sub(r"(?s)<!--.*?-->|<[^>]+>", " ", t)
+
+
+def _norm(t):
+  return " " + " ".join(re.findall(r"\w+", t.lower())) + " "
+
+
+def _ent(t):
+  t = re.sub(r"&#x([0-9a-fA-F]{1,5});", lambda m: chr(int(m.group(1), 16)), t)
+  t = re.sub(r"&#([0-9]{1,6});", lambda m: chr(int(m.group(1)) % 1114111), t)
+  for a, b in (("&nbsp;", " "), ("&amp;", "&"), ("&quot;", '"'), ("&lt;", "<"), ("&gt;", ">"), ("&apos;", "'")):
+    t = t.replace(a, b)
+  return t
+
+
+def _lazy(v):
+  try:
+    return v.get() if isinstance(v, gl.nondet.Lazy) else v
+  except Exception:
+    return v
+
+
+def _model_json(o):
+  if isinstance(o, str):
+    a, b = o.find("{"), o.rfind("}")
     try:
-      out = json.loads(t)
+      o = json.loads(o[a:b + 1]) if 0 <= a < b else None
     except Exception:
-      return None
-  return out if isinstance(out, dict) else None
-def _audit_job(claim, urls, ctx, label):
+      o = None
+  return o if isinstance(o, dict) else None
+
+
+def _judge(claim, urls, ctx, label, tr, cap):
   texts, status, flags = [], [], []
   for u in urls:
     try:
-      page = gl.nondet.web.render(u, mode="text")
+      r = _lazy(gl.nondet.web.get(u))
+      st = getattr(r, "status", None)
+      if int(r.status_code if st is None else st) != 200:
+        raise ValueError
+      page = bytes(r.body)[:2000000].decode("utf-8", errors="replace")
     except Exception:
       texts.append("")
       status.append("UNREACHABLE")
       continue
-    body = _clean(page, MAX_PAGE)
+    body = _clean(_ent(_body(page)), MAX_PAGE)
     if len(body) < MIN_PAGE:
       texts.append("")
       status.append("EMPTY")
@@ -187,12 +221,13 @@ def _audit_job(claim, urls, ctx, label):
     if hit and "SOURCE_INJECTION_REDACTED" not in flags:
       flags.append("SOURCE_INJECTION_REDACTED")
   def out(why, extra, ev=(), v=V_I, c=0):
-    return {"verdict": v, "confidence": c, "rationale": why, "evidence": list(ev),
+    raw = {"verdict": v, "confidence": c, "rationale": why, "evidence": list(ev),
         "source_status": status, "flags": flags + extra}
+    return apply_policy(raw, urls, tr, cap), texts
   if not any(texts):
     return out("No usable source content.", ["NO_USABLE_SOURCES"])
   try:
-    data = _model_json(gl.nondet.exec_prompt(_prompt(claim, label, ctx, urls, texts), response_format="json"))
+    data = _model_json(_lazy(gl.nondet.exec_prompt(_prompt(claim, label, ctx, urls, texts))))
   except Exception:
     data = None
   if data is None:
@@ -206,12 +241,12 @@ def _audit_job(claim, urls, ctx, label):
       continue
     if len(q) < MIN_QUOTE or not texts[i]:
       continue
-    if q.lower() not in texts[i].lower():
+    if _norm(q) not in _norm(texts[i]):
       extra = ["UNVERIFIED_QUOTE_DROPPED"]
       continue
     ok.append({"source_index": i, "quote": q, "stance": e.get("stance")})
   return out(data.get("rationale", ""), extra, ok, data.get("verdict"), data.get("confidence"))
-class DecentralizedAIAuditor(gl.Contract):
+class DecentralizedAIAuditor(gl.contract.Contract):
   owner: Address
   paused: bool
   strict: bool
@@ -262,17 +297,35 @@ class DecentralizedAIAuditor(gl.Contract):
     if int(self.ucount.get(self._sender(), 0)) >= MAX_RECORDS_PER_ADDRESS:
       _fail("LIMIT", "quota reached")
   def _evaluate(self, claim, urls, ctx, label):
+    tr = [self._trusted(_parse_url(u)[1]) for u in urls]
+    cap = int(self.tcount) > 0
+
     def leader():
-      return json.dumps(_audit_job(claim, urls, ctx, label), sort_keys=True)
-    raw = gl.eq_principle.prompt_comparative(leader, PRINCIPLE)
+      return json.dumps(_judge(claim, urls, ctx, label, tr, cap)[0], sort_keys=True)
+
+    def validator(res):
+      try:
+        if not isinstance(res, gl.vm.Return):
+          return False
+        lead = json.loads(res.calldata)
+        mine, texts = _judge(claim, urls, ctx, label, tr, cap)
+        if apply_policy(lead, urls, tr, cap) != lead:
+          return False
+        for e in lead["evidence"]:
+          if _norm(e["quote"]) not in _norm(texts[e["source_index"]]):
+            return False
+        return all(lead[k] == mine[k] for k in ("verdict", "confidence", "source_status"))
+      except Exception:
+        return False
+
+    raw = gl.vm.run_nondet(leader, validator)
     try:
       data = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
       data = None
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("verdict") not in VERDICTS:
       _fail("CONSENSUS_FAILED", "bad consensus result")
-    tr = [self._trusted(_parse_url(u)[1]) for u in urls]
-    return apply_policy(data, urls, tr, int(self.tcount) > 0), tr
+    return data, tr
   def _commit(self, kind, base, urls, tr, ctx, parent, rev, res, extra=None):
     aid = int(self.next_id)
     rec = {
@@ -304,7 +357,7 @@ class DecentralizedAIAuditor(gl.Contract):
     self._hosts([_parse_url(u)[1] for u in urls])
     return urls
   @gl.public.write
-  def submit_audit(self, claim: str, sources: list, context: str = "") -> int:
+  def submit_audit(self, claim: str, sources: list[str], context: str) -> int:
     self._live()
     claim = _text("claim", claim, MIN_CLAIM, MAX_CLAIM)
     context = _text("context", context, 0, MAX_CTX, True)
@@ -320,7 +373,7 @@ class DecentralizedAIAuditor(gl.Contract):
     self.statuses[u256(aid)] = "ACTIVE"
     return aid
   @gl.public.write
-  def request_reaudit(self, audit_id: int, extra_sources: list, context: str = "") -> int:
+  def request_reaudit(self, audit_id: int, extra_sources: list[str], context: str) -> int:
     self._live()
     base = self._load(audit_id)
     if self._status(audit_id) != "ACTIVE":
@@ -336,7 +389,7 @@ class DecentralizedAIAuditor(gl.Contract):
     self.statuses[u256(aid)] = "ACTIVE"
     return aid
   @gl.public.write
-  def file_dispute(self, audit_id: int, reason: str, extra_sources: list) -> dict:
+  def file_dispute(self, audit_id: int, reason: str, extra_sources: list[str]) -> dict:
     self._live()
     base = self._load(audit_id)
     if base["kind"] == "DISPUTE_REVIEW" or self._status(audit_id) != "ACTIVE":
@@ -365,17 +418,17 @@ class DecentralizedAIAuditor(gl.Contract):
     return {"dispute_audit_id": did, "outcome": outcome,
         "verdict": res["verdict"], "confidence": res["confidence"]}
   @gl.public.write
-  def set_paused(self, paused: bool) -> None:
+  def set_paused(self, paused: bool):
     self._owner()
     self.paused = bool(paused)
   @gl.public.write
-  def set_strict_sources(self, strict: bool) -> None:
+  def set_strict_sources(self, strict: bool):
     self._owner()
     if strict and int(self.tcount) == 0:
-      _fail("INVALID_INPUT", "no trusted domains")
+      _fail("INVALID_INPUT", "no trusted domain")
     self.strict = bool(strict)
   @gl.public.write
-  def add_trusted_domain(self, domain: str) -> None:
+  def add_trusted_domain(self, domain: str):
     self._owner()
     d = domain.strip().lower() if isinstance(domain, str) else ""
     if not _HOST.match(d) or d.endswith(_BLOCKED):
@@ -385,7 +438,7 @@ class DecentralizedAIAuditor(gl.Contract):
     self.tdom[d] = True
     self.tcount = u256(int(self.tcount) + 1)
   @gl.public.write
-  def remove_trusted_domain(self, domain: str) -> None:
+  def remove_trusted_domain(self, domain: str):
     self._owner()
     d = domain.strip().lower() if isinstance(domain, str) else ""
     if not self.tdom.get(d, False):
@@ -395,7 +448,7 @@ class DecentralizedAIAuditor(gl.Contract):
     if int(self.tcount) == 0:
       self.strict = False
   @gl.public.write
-  def transfer_ownership(self, new_owner: Address) -> None:
+  def transfer_ownership(self, new_owner: Address):
     self._owner()
     self.owner = new_owner
   @gl.public.view
@@ -405,9 +458,6 @@ class DecentralizedAIAuditor(gl.Contract):
     rec["entry_hash"] = self.hashes.get(u256(audit_id), "")
     return rec
   @gl.public.view
-  def get_claim_id(self, claim: str) -> str:
-    return _sha(_text("claim", claim, MIN_CLAIM, MAX_CLAIM).lower())[:32]
-  @gl.public.view
   def get_claim_history(self, claim_id: str) -> list:
     return json.loads(self.cindex.get(claim_id, "[]"))
   @gl.public.view
@@ -416,20 +466,6 @@ class DecentralizedAIAuditor(gl.Contract):
       if self._status(i) == "ACTIVE":
         return i
     return 0
-  @gl.public.view
-  def get_disputes(self, audit_id: int) -> list:
-    self._load(audit_id)
-    return json.loads(self.dindex.get(u256(audit_id), "[]"))
-  @gl.public.view
-  def list_audits(self, offset: int, limit: int) -> list:
-    if any(isinstance(x, bool) or not isinstance(x, int) for x in (offset, limit)) or offset < 0 or limit < 1:
-      _fail("INVALID_INPUT", "bad offset/limit")
-    out = []
-    for i in range(offset + 1, min(offset + min(limit, MAX_LIST), int(self.next_id) - 1) + 1):
-      r = json.loads(self.records[u256(i)])
-      out.append({"id": i, "kind": r["kind"], "claim_id": r["claim_id"], "verdict": r["verdict"],
-        "confidence": r["confidence"], "status": self._status(i)})
-    return out
   def _entry_ok(self, i, body):
     if _sha(body) != self.hashes.get(u256(i), ""):
       return "hash mismatch"

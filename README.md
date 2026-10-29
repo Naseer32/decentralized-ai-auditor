@@ -2,85 +2,70 @@
 
 A [GenLayer](https://www.genlayer.com) Intelligent Contract that audits AI-generated claims against web sources, records each verdict with evidence and a confidence level, and keeps a tamper-evident audit history.
 
-- **Contract:** `contracts/decentralized_ai_auditor.py` (about 19.9 KB)
+- **Contract:** `contracts/decentralized_ai_auditor.py` (about 19.9 KB; header `py-genlayer:test`, for GenLayer Studio)
 - **Studio address (tested):** `0xd3E17a9E243C6A275d652a6c1142eADbf944B0bB`
-- **Bradbury address:** `0x65aA3ce55c9Bc1895586021A20F0Be4dAa674096` (deployed, but transactions were not processing, so testing was done on Studio)
+- **Bradbury address:** `0x65aA3ce55c9Bc1895586021A20F0Be4dAa674096` (deployed earlier; transactions were not processing, so testing was done on Studio)
 
-## How it works
+## How consensus works
 
-1. A caller submits a claim and 1-5 public https source URLs.
-2. Each validator independently fetches the sources and asks an LLM to judge the claim.
-3. Consensus uses `gl.eq_principle.prompt_comparative`: verdicts must match exactly and confidence must be within 15 points.
-4. A deterministic policy validates the result, applies caps, and stores a hash-chained record.
+The decision is made **before** consensus, so nothing that influences the stored result is applied afterwards.
 
-Evidence quotes must be exact substrings of the fetched page. Fabricated quotes are dropped and the verdict is downgraded.
+1. Every validator fetches the sources and asks an LLM for a verdict, confidence and evidence quotes.
+2. The deterministic policy (`apply_policy`) runs inside that same non-deterministic block: it drops quotes that are not verbatim on the page, enforces verdict/evidence consistency, applies confidence caps, and maps confidence to a band.
+3. The leader returns the final record fields. A custom validator (`gl.vm.run_nondet`) accepts only if:
+   - the leader result is exactly what `apply_policy` would produce (no forged or un-banded fields),
+   - every evidence quote appears verbatim in the validator's own fetch of that source,
+   - `verdict`, `confidence` and `source_status` equal the validator's own final result exactly.
+4. The accepted result is stored as-is. No post-consensus step can change the verdict, confidence or dispute outcome.
+
+### Confidence bands
+
+Confidence is stored as a band floor: `0` (low, under 60), `60` (medium, 60-79) or `80` (high, 80-100). The dispute-overturn threshold (60) is a band edge, so validators whose raw confidences fall on opposite sides of it land in different bands and do not reach consensus. Confidence caps (30, 60, 70, 80) are applied deterministically before banding. Evidence quote choice may differ between validators; anything that changes the final verdict or confidence band is bound.
+
+Quote verification ignores case, punctuation and whitespace and matches whole words; HTML tags are stripped and entities (`&nbsp;`, `&#160;`, `&amp;`...) are decoded before judging.
 
 ## Verdicts
 
 | Verdict | Meaning |
 |---|---|
 | SUPPORTED | Sources establish the whole claim |
-| PARTIALLY_SUPPORTED | Some parts established, others missing or overstated |
-| UNSUPPORTED | Sources are relevant but do not establish the claim |
+| PARTIALLY_SUPPORTED | Some parts established, others missing |
+| UNSUPPORTED | Sources relevant but do not establish it |
 | CONTRADICTED | Sources conflict with the claim |
 | INCONCLUSIVE | Sources unavailable, irrelevant or insufficient |
 
-## Record kinds and statuses
-
-- Kinds: `AUDIT`, `REAUDIT`, `DISPUTE_REVIEW`
-- Statuses: `ACTIVE`, `SUPERSEDED`, `OVERTURNED`, `DISPUTE_REJECTED`
-- Exactly one record per claim is `ACTIVE`. Status lives outside the hashed record, so history is never rewritten.
+Record kinds: `AUDIT`, `REAUDIT`, `DISPUTE_REVIEW`. Statuses: `ACTIVE`, `SUPERSEDED`, `OVERTURNED`, `DISPUTE_REJECTED`. Exactly one record per claim is `ACTIVE`; status lives outside the hashed record.
 
 ## Methods
 
-Write methods:
+Write: `submit_audit(claim, sources, context)`, `request_reaudit(audit_id, extra_sources, context)` (pass `""` for an empty context), `file_dispute(audit_id, reason, extra_sources)`, and owner-only `set_paused`, `set_strict_sources`, `add_trusted_domain`, `remove_trusted_domain`, `transfer_ownership`.
 
-| Method | Purpose |
-|---|---|
-| `submit_audit(claim, sources, context="")` | First audit of a claim. Returns the audit id |
-| `request_reaudit(audit_id, extra_sources, context="")` | New version of the ACTIVE audit, optionally with more sources |
-| `file_dispute(audit_id, reason, extra_sources)` | Independent re-evaluation. Returns outcome `UPHELD` or `OVERTURNED` |
-| `set_paused(paused)` | Owner: pause or resume writes |
-| `set_strict_sources(strict)` | Owner: only allow trusted domains |
-| `add_trusted_domain(domain)` | Owner: trust a domain (subdomains included) |
-| `remove_trusted_domain(domain)` | Owner: remove a trusted domain |
-| `transfer_ownership(new_owner)` | Owner: hand over ownership |
-
-Read methods: `get_audit`, `get_claim_id`, `get_claim_history`, `get_active_audit`, `get_disputes`, `list_audits`, `verify_audit`, `verify_chain`, `get_stats` (includes owner, chain head, verdict counts and config).
+Read: `get_audit`, `get_claim_history`, `get_active_audit`, `verify_audit`, `verify_chain`, `get_stats` (includes owner, chain head, verdict counts, config). Iterate `get_audit(1..total_records)` to walk the full history; disputes appear in `get_claim_history` as `DISPUTE_REVIEW` records with a `parent_id`.
 
 ## Rules and limits
 
 | Rule | Value |
 |---|---|
-| Claim length | 10-1000 characters |
-| Context length | up to 500 characters |
-| Dispute reason | 20-800 characters |
+| Claim / context / dispute reason | 10-1000 / up to 500 / 20-800 characters |
 | Sources per audit | 1-5, https only, public DNS names, port 443 |
 | Max revisions per claim | 5 |
-| Max disputes per audit | 3, and one per address |
+| Max disputes per audit | 3, one per address |
 | Records per address | 500 |
-| Dispute overturns an audit only if | new verdict differs, is not INCONCLUSIVE, confidence >= 60 |
+| Dispute overturns only if | new verdict differs, is not INCONCLUSIVE, confidence band >= 60 |
 
-Confidence caps: single evidence item 80; no trusted-domain evidence (when a trust list exists) 70; UNSUPPORTED without quotes 60; verdict downgraded to INCONCLUSIVE because of missing or mismatched evidence 30.
+Caps: single evidence 80; no trusted-domain evidence (when a trust list exists) 70; UNSUPPORTED without quotes 60; downgraded to INCONCLUSIVE 30.
 
 ## Integrity
 
-Each record is canonical JSON containing `prev_hash`. `entry_hash = sha256(record)`. Records are never edited or deleted. `verify_audit` and `verify_chain` recompute the chain on demand, and `get_stats().chain_head` shows the latest hash.
+Each record is canonical JSON containing `prev_hash`; `entry_hash = sha256(record)`. Records are never edited or deleted. `verify_audit` and `verify_chain` recompute the chain on demand.
 
 ## Anti-manipulation
 
-- Strict input validation (types, lengths, URL rules, blocked hosts such as localhost, IP addresses and `.local`/`.internal` names)
-- Prompt-injection screening of claims, context and dispute reasons
-- Injection phrases inside fetched pages are redacted
-- Claim, context and sources are delimited as untrusted data in the prompt
-- Evidence must be verbatim from the fetched page
-- Verdict and evidence must be consistent, otherwise the verdict is downgraded
-- Per-address quotas, revision and dispute limits
-- The owner can pause the contract and manage trusted domains but cannot edit or delete records
+Strict input validation, blocked hosts (localhost, IPs, `.local`/`.internal`), prompt-injection screening of claims, context and reasons, redaction of injection phrases in fetched pages, untrusted-data delimiters in the prompt, verbatim-evidence rule, per-address quotas, revision and dispute limits. The owner can pause and manage trusted domains but cannot edit or delete records.
 
 ## Errors
 
-Errors are raised as `UserError("[CODE] message")`. Codes: `PAUSED`, `FORBIDDEN`, `INVALID_INPUT`, `NOT_FOUND`, `CONFLICT`, `LIMIT`, `UNTRUSTED_SOURCE`, `CONSENSUS_FAILED`.
+`UserError("[CODE] message")`: `PAUSED`, `FORBIDDEN`, `INVALID_INPUT`, `NOT_FOUND`, `CONFLICT`, `LIMIT`, `UNTRUSTED_SOURCE`, `CONSENSUS_FAILED`.
 
 ## Tests
 
@@ -88,15 +73,8 @@ Errors are raised as `UserError("[CODE] message")`. Codes: `PAUSED`, `FORBIDDEN`
 python -m unittest discover -s tests -v
 ```
 
-56 tests run against a fake `genlayer` module (`tests/harness.py`) with mocked web and LLM calls. They cover all contract logic but not real validator consensus. For on-chain testing, follow `STUDIO_TEST_GUIDE.md` (written in Hausa).
-
-## Deploy
-
-1. Open GenLayer Studio and add `contracts/decentralized_ai_auditor.py`.
-2. Deploy with no constructor arguments.
-3. Test using `STUDIO_TEST_GUIDE.md`.
+72 tests run against a fake `genlayer` module (`tests/harness.py`) with mocked web and LLM calls, including a leader/validator simulation that checks forged results, band-boundary disagreement and dispute-threshold disagreement are rejected. They do not exercise real validator networks; use `STUDIO_TEST_GUIDE.md` for on-chain testing.
 
 ## Notes
 
-- LLM verdicts can vary slightly between runs. Validation errors, statuses and the hash chain are deterministic.
-- There is no payment, swapping or trading functionality.
+LLM verdicts can vary between runs. Near a band edge, validators may fail to agree and the transaction can be retried. No payment, swapping or trading functionality.
